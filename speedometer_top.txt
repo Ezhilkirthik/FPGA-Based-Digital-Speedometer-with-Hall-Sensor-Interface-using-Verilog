@@ -1,0 +1,378 @@
+// speedometer_top.v
+// Top-level module for the FPGA-based Digital Speedometer.
+// Integrates all sub-modules to measure vehicle speed, display it on a
+// seven-segment display, and activate an LED for over-speed alerts.
+
+module speedometer_top (
+    input wire clk,                 // 50 MHz system clock
+    input wire reset_n,             // Active-low reset
+    input wire hall_effect_input,   // Input from Hall effect sensor (pulse train)
+
+    output wire [6:0] seven_seg_hex0, // 7-segment display output for ONES digit
+    output wire [6:0] seven_seg_hex1, // 7-segment display output for TENS digit
+    output wire [6:0] seven_seg_hex2, // 7-segment display output for HUNDREDS digit
+    output wire red_led             // Red LED output (active high for over-speed)
+);
+
+    // Internal signals
+    wire timer_done;        // Signal indicating the end of a 0.5-second measurement period
+    wire timer_reset;       // Signal to reset the pulse counter
+    wire [8:0] pulse_count; // Count of Hall effect pulses within the period (max 444, so 9 bits)
+    wire [7:0] speed_kmh;   // Calculated speed in km/h (0-255, so 8 bits)
+
+    wire [3:0] hundreds_digit; // BCD for hundreds digit
+    wire [3:0] tens_digit;     // BCD for tens digit
+    wire [3:0] ones_digit;     // BCD for ones digit
+
+    // Instantiate clock_divider module
+    // This module generates a 'timer_done' pulse every 0.5 seconds.
+    // 50 MHz clock -> 0.5 second period requires 25,000,000 clock cycles.
+    clock_divider #(
+        .MAX_COUNT (25_000_000 - 1) // Count from 0 to MAX_COUNT
+    ) clk_div_inst (
+        .clk        (clk),
+        .reset_n    (reset_n),
+        .timer_done (timer_done),
+        .timer_reset (timer_reset) // Output to reset the pulse counter
+    );
+
+    // Instantiate pulse_counter module
+    // This module counts the rising edges of the hall_effect_input
+    // during the 0.5-second measurement window.
+    pulse_counter pulse_cnt_inst (
+        .clk                (clk),
+        .reset_n            (reset_n),
+        .hall_effect_input  (hall_effect_input),
+        .timer_done         (timer_done),
+        .timer_reset        (timer_reset),
+        .pulse_count_out    (pulse_count)
+    );
+
+    // Instantiate speed_calculator module
+    // Converts the raw pulse count into speed in km/h.
+    // The conversion factor is derived from the paper's simulation results:
+    // 150 pulses -> 86 km/h, 200 pulses -> 115 km/h.
+    // Approx. speed = (pulse_count * 23) / 40
+    speed_calculator speed_calc_inst (
+        .pulse_count_in (pulse_count),
+        .speed_kmh_out  (speed_kmh)
+    );
+
+    // Instantiate bcd_to_digits module
+    // Converts the 8-bit speed value into three 4-bit BCD digits
+    // (hundreds, tens, ones) for the 7-segment displays.
+    bcd_to_digits bcd_conv_inst (
+        .speed_in       (speed_kmh),
+        .hundreds_out   (hundreds_digit),
+        .tens_out       (tens_digit),
+        .ones_out       (ones_digit)
+    );
+
+    // Instantiate seven_segment_decoder for each digit
+    // These modules convert the BCD digits into the specific 7-segment patterns
+    // as shown in the research paper's figures and table.
+    seven_segment_decoder decoder_hex0 (
+        .bcd_in     (ones_digit),
+        .seg_out    (seven_seg_hex0)
+    );
+
+    seven_segment_decoder decoder_hex1 (
+        .bcd_in     (tens_digit),
+        .seg_out    (seven_seg_hex1)
+    );
+
+    seven_segment_decoder decoder_hex2 (
+        .bcd_in     (hundreds_digit),
+        .seg_out    (seven_seg_hex2)
+    );
+
+    // Instantiate red_led_controller module
+    // Activates the red LED if the speed exceeds 110 km/h.
+    red_led_controller led_ctrl_inst (
+        .speed_in   (speed_kmh),
+        .red_led_out(red_led)
+    );
+
+endmodule
+
+//-----------------------------------------------------------------------------
+
+// clock_divider.v
+// Divides the input clock to generate a 'timer_done' pulse every MAX_COUNT cycles,
+// which corresponds to a 0.5-second interval for a 50 MHz clock.
+// Also generates a 'timer_reset' signal to reset the pulse counter.
+
+module clock_divider #(
+    parameter MAX_COUNT = 25_000_000 - 1 // Default for 0.5s @ 50MHz
+) (
+    input wire clk,         // Input clock (e.g., 50 MHz)
+    input wire reset_n,     // Active-low reset
+    output reg timer_done,  // Pulse high for one clock cycle when timer expires
+    output reg timer_reset  // High during the entire measurement period to reset pulse counter
+);
+
+    reg [24:0] count; // Counter to reach MAX_COUNT (25M requires 25 bits)
+
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            count <= 0;
+            timer_done <= 0;
+            timer_reset <= 0;
+        end else begin
+            if (count == MAX_COUNT) begin
+                count <= 0;
+                timer_done <= 1;    // Assert timer_done for one clock cycle
+                timer_reset <= 1;   // Keep timer_reset high for one cycle to reset pulse counter
+            end else begin
+                count <= count + 1;
+                timer_done <= 0;    // De-assert timer_done
+                if (timer_done) begin // De-assert timer_reset after one cycle of timer_done
+                    timer_reset <= 0;
+                end
+            end
+        end
+    end
+
+endmodule
+
+//-----------------------------------------------------------------------------
+
+// pulse_counter.v
+// Counts the number of rising edges on the hall_effect_input.
+// The counter is reset by 'timer_reset' and holds its value when 'timer_done' is high.
+
+module pulse_counter (
+    input wire clk,                 // System clock
+    input wire reset_n,             // Active-low reset
+    input wire hall_effect_input,   // Input from Hall effect sensor
+    input wire timer_done,          // Indicates end of measurement period
+    input wire timer_reset,         // Resets the counter for a new measurement
+    output reg [8:0] pulse_count_out // Output pulse count (up to 444, so 9 bits needed for 511)
+);
+
+    reg hall_effect_prev; // Previous state of hall_effect_input for edge detection
+
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            pulse_count_out <= 0;
+            hall_effect_prev <= 0;
+        end else begin
+            // Reset the counter at the beginning of each measurement period
+            if (timer_reset) begin
+                pulse_count_out <= 0;
+            end else if (!timer_done) begin // Only count when not in the 'done' state
+                // Detect rising edge of hall_effect_input
+                if (hall_effect_input == 1'b1 && hall_effect_prev == 1'b0) begin
+                    pulse_count_out <= pulse_count_out + 1;
+                end
+            end
+            hall_effect_prev <= hall_effect_input; // Update previous state
+        end
+    end
+
+endmodule
+
+//-----------------------------------------------------------------------------
+
+// speed_calculator.v
+// Calculates the speed in km/h based on the pulse count.
+// Uses integer arithmetic to approximate the conversion factor.
+
+module speed_calculator (
+    input wire [8:0] pulse_count_in, // Input pulse count
+    output reg [7:0] speed_kmh_out   // Output speed in km/h (0-255)
+);
+
+    // Derived conversion: speed_kmh = (pulse_count * 23) / 40
+    // Example: 150 pulses -> (150 * 23) / 40 = 3450 / 40 = 86.25 -> 86 km/h
+    // Example: 200 pulses -> (200 * 23) / 40 = 4600 / 40 = 115 km/h
+    // Max pulses (444) -> (444 * 23) / 40 = 10212 / 40 = 255.3 -> 255 km/h (max displayable)
+
+    always @(*) begin
+        speed_kmh_out = (pulse_count_in * 23) / 40;
+    end
+
+endmodule
+
+//-----------------------------------------------------------------------------
+
+// bcd_to_digits.v
+// Converts an 8-bit speed value (0-255) into three 4-bit BCD digits
+// for hundreds, tens, and ones places.
+
+module bcd_to_digits (
+    input wire [7:0] speed_in,      // Input speed value (0-255)
+    output reg [3:0] hundreds_out,  // BCD for hundreds digit
+    output reg [3:0] tens_out,      // BCD for tens digit
+    output reg [3:0] ones_out       // BCD for ones digit
+);
+
+    always @(*) begin
+        hundreds_out = speed_in / 100;
+        tens_out = (speed_in % 100) / 10;
+        ones_out = speed_in % 10;
+    end
+
+endmodule
+
+//-----------------------------------------------------------------------------
+
+// seven_segment_decoder.v
+// Decodes a 4-bit BCD input to a 7-segment display pattern.
+// The patterns are taken directly from the provided research paper's
+// simulation figures and Table 1, assuming active-low segments (0=ON, 1=OFF)
+// and segment order a,b,c,d,e,f,g (output bit 6 is 'a', bit 0 is 'g').
+// Note: These patterns are unconventional for standard 7-segment displays.
+
+module seven_segment_decoder (
+    input wire [3:0] bcd_in,    // 4-bit BCD input (0-9)
+    output reg [6:0] seg_out    // 7-segment output (a,b,c,d,e,f,g)
+);
+
+    always @(*) begin
+        case (bcd_in)
+            4'd0: seg_out = 7'b1000000; // From Fig 5 (HEX2 for '0')
+            4'd1: seg_out = 7'b1111001; // From Fig 6 (HEX1, HEX2 for '1')
+            4'd2: seg_out = 7'b0100100; // From Table 1
+            4'd3: seg_out = 7'b0110000; // From Table 1
+            4'd4: seg_out = 7'b0011001; // From Table 1
+            4'd5: seg_out = 7'b0010010; // From Fig 6 (HEX0 for '5')
+            4'd6: seg_out = 7'b0000010; // From Fig 5 (HEX0 for '6')
+            4'd7: seg_out = 7'b1111000; // From Table 1
+            4'd8: seg_out = 7'b0000000; // From Fig 5 (HEX1 for '8')
+            4'd9: seg_out = 7'b0010000; // From Table 1
+            default: seg_out = 7'b1111111; // All segments OFF for invalid input
+        endcase
+    end
+
+endmodule
+
+//-----------------------------------------------------------------------------
+
+// red_led_controller.v
+// Controls the red LED based on the speed limit.
+// LED is active high when speed exceeds 110 km/h.
+
+module red_led_controller (
+    input wire [7:0] speed_in,      // Input speed value in km/h
+    output reg red_led_out          // Output for the red LED
+);
+
+    parameter SPEED_LIMIT = 110; // Speed limit in km/h
+
+    always @(*) begin
+        if (speed_in > SPEED_LIMIT) begin
+            red_led_out = 1'b1; // Activate LED
+        end else begin
+            red_led_out = 1'b0; // Deactivate LED
+        end
+    end
+
+endmodule
+
+//-----------------------------------------------------------------------------
+
+// test_speedometer_tb.v
+// Testbench for the speedometer_top module.
+// Simulates two scenarios from the research paper:
+// 1. Speed below 110 km/h (86 km/h)
+// 2. Speed above 110 km/h (115 km/h)
+
+`timescale 1ns / 1ps
+
+module test_speedometer_tb;
+
+    // Inputs
+    reg clk;
+    reg reset_n;
+    reg hall_effect_input;
+
+    // Outputs
+    wire [6:0] seven_seg_hex0;
+    wire [6:0] seven_seg_hex1;
+    wire [6:0] seven_seg_hex2;
+    wire red_led;
+
+    // Instantiate the Unit Under Test (UUT)
+    speedometer_top uut (
+        .clk                (clk),
+        .reset_n            (reset_n),
+        .hall_effect_input  (hall_effect_input),
+        .seven_seg_hex0     (seven_seg_hex0),
+        .seven_seg_hex1     (seven_seg_hex1),
+        .seven_seg_hex2     (seven_seg_hex2),
+        .red_led            (red_led)
+    );
+
+    // Clock generation (50 MHz, period = 20ns)
+    initial begin
+        clk = 0;
+        forever #10 clk = ~clk; // 10ns high, 10ns low -> 20ns period -> 50 MHz
+    end
+
+    // Test sequence
+    initial begin
+        // Initialize inputs
+        reset_n = 0;
+        hall_effect_input = 0;
+
+        // Apply reset
+        #100;
+        reset_n = 1;
+        $display("Simulation Start");
+
+        // --- Scenario 1: Speed below 110 km/h (Target 86 km/h) ---
+        // Requires ~150 pulses in 0.5 seconds
+        // Pulse frequency = 150 pulses / 0.5s = 300 Hz
+        // Pulse period = 1 / 300 Hz = 3.333 ms = 3,333,333 ns
+        // Half period = 1,666,666.5 ns
+        $display("\n--- Simulating Speed 86 km/h (N=150 pulses) ---");
+        repeat (150) begin
+            #1666666; // Half period
+            hall_effect_input = 1;
+            #1666667; // Half period
+            hall_effect_input = 0;
+        end
+        // Wait for the 0.5s timer to expire and speed to update
+        #2000000; // Give some extra time for the clock divider to finish its cycle
+
+        $display("Speed (km/h): %d", uut.speed_kmh);
+        $display("HEX2 (Hundreds): %b", seven_seg_hex2);
+        $display("HEX1 (Tens): %b", seven_seg_hex1);
+        $display("HEX0 (Ones): %b", seven_seg_hex0);
+        $display("Red LED: %b", red_led);
+        // Expected: Speed ~86, HEX2=1000000, HEX1=0000000, HEX0=0000010, red_led=0
+
+        // --- Scenario 2: Speed above 110 km/h (Target 115 km/h) ---
+        // Requires ~200 pulses in 0.5 seconds
+        // Pulse frequency = 200 pulses / 0.5s = 400 Hz
+        // Pulse period = 1 / 400 Hz = 2.5 ms = 2,500,000 ns
+        // Half period = 1,250,000 ns
+        $display("\n--- Simulating Speed 115 km/h (N=200 pulses) ---");
+        repeat (200) begin
+            #1250000; // Half period
+            hall_effect_input = 1;
+            #1250000; // Half period
+            hall_effect_input = 0;
+        end
+        // Wait for the 0.5s timer to expire and speed to update
+        #2000000; // Give some extra time
+
+        $display("Speed (km/h): %d", uut.speed_kmh);
+        $display("HEX2 (Hundreds): %b", seven_seg_hex2);
+        $display("HEX1 (Tens): %b", seven_seg_hex1);
+        $display("HEX0 (Ones): %b", seven_seg_hex0);
+        $display("Red LED: %b", red_led);
+        // Expected: Speed ~115, HEX2=1111001, HEX1=1111001, HEX0=0010010, red_led=1
+
+        #1000; // Final delay
+        $finish; // End simulation
+    end
+
+    // Monitor outputs (optional, for detailed waveform viewing)
+    initial begin
+        $dumpfile("speedometer.vcd");
+        $dumpvars(0, test_speedometer_tb);
+    end
+
+endmodule
